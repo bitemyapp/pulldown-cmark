@@ -32,6 +32,7 @@ pub(crate) fn run_first_pass(text: &str, options: Options) -> (Tree<Item>, Alloc
         tree: Tree::with_capacity(start_capacity),
         begin_list_item: None,
         cmark_empty_item_blank: false,
+        cmark_item_emptied: false,
         last_line_blank: false,
         allocs: Allocations::new(),
         options,
@@ -61,6 +62,9 @@ struct FirstPass<'a, 'b> {
     /// cmark-gfm: the empty item at `begin_list_item` was kept open by a
     /// blank line indented to its content.
     cmark_empty_item_blank: bool,
+    /// cmark-gfm: a list item's only paragraph turned out to be all
+    /// definitions; the blank line that ended it still found it there.
+    cmark_item_emptied: bool,
     last_line_blank: bool,
     allocs: Allocations<'a>,
     options: Options,
@@ -133,9 +137,18 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             if let Some((ch, index, indent)) = line_start.scan_list_marker_with_indent(outer_indent)
             {
                 let after_marker_index = start_ix + line_start.bytes_scanned();
-                self.continue_list(container_start - outer_indent, ch, index);
+                let mut item_start = container_start - outer_indent;
+                if self.options.cmark_gfm_compat() {
+                    // Part of a tab may have gone to a container's prefix:
+                    // the indentation can be less than a byte a column.
+                    while item_start < container_start && !matches!(bytes[item_start], b' ' | b'\t')
+                    {
+                        item_start += 1;
+                    }
+                }
+                self.continue_list(item_start, ch, index);
                 self.tree.append(Item {
-                    start: container_start - outer_indent,
+                    start: item_start,
                     end: after_marker_index, // will get updated later if item not empty
                     body: ItemBody::ListItem(indent),
                 });
@@ -294,7 +307,20 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
         let ix = start_ix + line_start.bytes_scanned();
 
+        let item_emptied = std::mem::take(&mut self.cmark_item_emptied);
         if let Some(n) = scan_blank_line(&bytes[ix..]) {
+            if item_emptied
+                && self
+                    .tree
+                    .peek_up()
+                    .is_some_and(|item| matches!(self.tree[item].item.body, ItemBody::ListItem(_)))
+            {
+                // cmark-gfm: the item kept this line; from now on it is an
+                // empty item.
+                self.begin_list_item = Some(ix + n);
+                self.cmark_empty_item_blank = true;
+                return ix + n;
+            }
             // cmark-gfm: a line indented to an empty item's content keeps
             // the item open, blank as it is.
             let keeps_empty_item = self.options.cmark_gfm_compat()
@@ -814,7 +840,13 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     self.tree[node_ix].item = self.tree[marker].item;
                     self.tree[node_ix].child = None;
                 }
-                None => self.tree.remove_trailing_nodes(node_ix, before_paragraph),
+                None => {
+                    self.tree.remove_trailing_nodes(node_ix, before_paragraph);
+                    self.cmark_item_emptied = before_paragraph.is_none()
+                        && self.tree.peek_up().is_some_and(|item| {
+                            matches!(self.tree[item].item.body, ItemBody::ListItem(_))
+                        });
+                }
             }
         }
         ix
@@ -905,11 +937,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 }
                 // A lazy line keeps its indentation in cmark's content, and
                 // at the start of a paragraph that is text.
-                let text_start = child.map_or(start, |c| self.tree[c].item.start);
-                if text_start > start {
+                let indentation_end =
+                    start + scan_while(&bytes[start..], |b| b == b' ' || b == b'\t');
+                if indentation_end > start {
                     let indentation = self.tree.create_node(Item {
                         start,
-                        end: text_start,
+                        end: indentation_end,
                         body: ItemBody::Text {
                             backslash_escaped: false,
                         },
@@ -980,7 +1013,22 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         let columns = alignment.len();
         let alignment_ix = self.allocs.allocate_alignment(alignment);
         let delimiter_end = delimiter_ix + scan_nextline(&bytes[delimiter_ix..]);
+        let marker = self.tree[node_ix]
+            .child
+            .filter(|&c| matches!(self.tree[c].item.body, ItemBody::TaskListMarker(_)));
         match previous_line {
+            None if marker.is_some() => {
+                // A task item's box stays, before the table.
+                self.tree[node_ix].item = self.tree[marker.unwrap()].item;
+                self.tree[node_ix].child = None;
+                self.tree.pop();
+                self.tree.append(Item {
+                    start: header_ix,
+                    end: 0, // set by `parse_table`
+                    body: ItemBody::Table(alignment_ix),
+                });
+                self.tree.push();
+            }
             None => {
                 self.tree[node_ix].item.body = ItemBody::Table(alignment_ix);
                 self.tree[node_ix].child = None;
@@ -1258,6 +1306,22 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     }
                     LoopInstruction::ContinueAndSkip(count - 1)
                 }
+                b'^' if self.options.cmark_gfm_compat() => {
+                    // swift-cmark's inline attributes open with `^[`.
+                    if bytes.get(ix + 1) == Some(&b'[') {
+                        self.tree.append_text(begin_text, ix, backslash_escaped);
+                        backslash_escaped = false;
+                        self.tree.append(Item {
+                            start: ix,
+                            end: ix + 2,
+                            body: ItemBody::MaybeAttributes,
+                        });
+                        begin_text = ix + 2;
+                        LoopInstruction::ContinueAndSkip(1)
+                    } else {
+                        LoopInstruction::ContinueAndSkip(0)
+                    }
+                }
                 c @ b'*' | c @ b'_' | c @ b'~' | c @ b'^' => {
                     let string_suffix = &self.text[ix..];
                     let count = 1 + scan_ch_repeat(&string_suffix.as_bytes()[1..], c);
@@ -1442,7 +1506,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     begin_text = ix + 1;
                     LoopInstruction::ContinueAndSkip(0)
                 }
-                b'&' => match scan_entity(&bytes[ix..]) {
+                b'&' => match if self.options.cmark_gfm_compat() {
+                    cmark_compat::scan_entity(&bytes[ix..])
+                } else {
+                    scan_entity(&bytes[ix..])
+                } {
                     (n, Some(value)) => {
                         self.tree.append_text(begin_text, ix, backslash_escaped);
                         backslash_escaped = false;
@@ -1727,7 +1795,14 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // to just do a forward scan here?
         let mut ix = info_start + scan_nextline(&bytes[info_start..]);
         let info_end = ix - scan_rev_while(&bytes[info_start..ix], is_ascii_whitespace);
-        let info_string = unescape(&self.text[info_start..info_end], self.tree.is_in_table());
+        let info_string = if self.options.cmark_gfm_compat() {
+            let rest = &bytes[start_ix + n_fence_char..];
+            let line_end =
+                start_ix + n_fence_char + memchr::memchr2(b'\n', b'\r', rest).unwrap_or(rest.len());
+            cmark_compat::clean_info(&self.text[start_ix + n_fence_char..line_end]).into()
+        } else {
+            unescape(&self.text[info_start..info_end], self.tree.is_in_table())
+        };
         self.tree.append(Item {
             start: start_ix,
             end: 0, // will get set later
@@ -1747,8 +1822,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             let mut close_line_start = line_start.clone();
             if !close_line_start.scan_space(4 - indent) {
                 let close_ix = ix + close_line_start.bytes_scanned();
-                if let Some(n) = scan_closing_code_fence(&bytes[close_ix..], fence_ch, n_fence_char)
-                {
+                let closing = if self.options.cmark_gfm_compat() {
+                    cmark_compat::closing_code_fence(&bytes[close_ix..], fence_ch, n_fence_char)
+                } else {
+                    scan_closing_code_fence(&bytes[close_ix..], fence_ch, n_fence_char)
+                };
+                if let Some(n) = closing {
                     ix = close_ix + n;
                     self.pop(ix);
                     // try to read trailing whitespace or it will register as a completely blank line
@@ -2017,6 +2096,23 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             (ix, ix, None)
         };
         self.tree[header_node_idx].item.end = end;
+
+        if self.options.cmark_gfm_compat() && attrs.is_none() {
+            // cmark-gfm's `chop_trailing_hashtags`, on the whole line: trailing
+            // whitespace (tabs too), then `#`s after a space or tab.
+            let line_start = bytes[..header_start]
+                .iter()
+                .rposition(|&b| b == b'\n' || b == b'\r')
+                .map_or(0, |p| p + 1);
+            let line = cmark_compat::line_around(bytes, header_start);
+            let chopped = line_start + cmark_compat::chop_trailing_hashtags(line);
+            if self.tree.cur().is_some() {
+                self.tree.truncate_siblings(chopped.max(header_start));
+            }
+            self.tree.pop();
+            self.tree[heading_ix].item.body = ItemBody::Heading(atx_level, None);
+            return end;
+        }
 
         // remove trailing matter from header text
         let mut empty_text_node = false;
@@ -2768,7 +2864,7 @@ fn special_bytes(options: &Options) -> [bool; 256] {
     {
         bytes[b'~' as usize] = true;
     }
-    if options.contains(Options::ENABLE_SUPERSCRIPT) {
+    if options.contains(Options::ENABLE_SUPERSCRIPT) || options.cmark_gfm_compat() {
         bytes[b'^' as usize] = true;
     }
     if options.contains(Options::ENABLE_MATH) {
@@ -3013,7 +3109,7 @@ mod simd {
         {
             add_lookup_byte(&mut lookup, b'~');
         }
-        if options.contains(Options::ENABLE_SUPERSCRIPT) {
+        if options.contains(Options::ENABLE_SUPERSCRIPT) || options.cmark_gfm_compat() {
             add_lookup_byte(&mut lookup, b'^');
         }
         if options.contains(Options::ENABLE_MATH) {

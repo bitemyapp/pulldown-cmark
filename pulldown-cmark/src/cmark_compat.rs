@@ -9,7 +9,7 @@ use unicase::UniCase;
 
 use crate::linklabel::{scan_link_label_rest, LinkLabel};
 use crate::parse::{Item, ItemBody};
-use crate::scanners::scan_entity;
+use crate::scanners;
 use crate::strings::CowStr;
 use crate::tree::{Tree, TreeIndex};
 use crate::Alignment;
@@ -52,153 +52,33 @@ pub(crate) fn is_punctuation(c: char) -> bool {
 }
 
 /// The non-ASCII ranges of `cmark_utf8proc_is_punctuation`, merged.
+#[rustfmt::skip]
 static PUNCTUATION: [(u32, u32); 146] = [
-    (0x00A1, 0x00A1),
-    (0x00A7, 0x00A7),
-    (0x00AB, 0x00AB),
-    (0x00B6, 0x00B7),
-    (0x00BB, 0x00BB),
-    (0x00BF, 0x00BF),
-    (0x037E, 0x037E),
-    (0x0387, 0x0387),
-    (0x055A, 0x055F),
-    (0x0589, 0x058A),
-    (0x05BE, 0x05BE),
-    (0x05C0, 0x05C0),
-    (0x05C3, 0x05C3),
-    (0x05C6, 0x05C6),
-    (0x05F3, 0x05F4),
-    (0x0609, 0x060A),
-    (0x060C, 0x060D),
-    (0x061B, 0x061B),
-    (0x061E, 0x061F),
-    (0x066A, 0x066D),
-    (0x06D4, 0x06D4),
-    (0x0700, 0x070D),
-    (0x07F7, 0x07F9),
-    (0x0830, 0x083E),
-    (0x085E, 0x085E),
-    (0x0964, 0x0965),
-    (0x0970, 0x0970),
-    (0x0AF0, 0x0AF0),
-    (0x0DF4, 0x0DF4),
-    (0x0E4F, 0x0E4F),
-    (0x0E5A, 0x0E5B),
-    (0x0F04, 0x0F12),
-    (0x0F14, 0x0F14),
-    (0x0F3A, 0x0F3D),
-    (0x0F85, 0x0F85),
-    (0x0FD0, 0x0FD4),
-    (0x0FD9, 0x0FDA),
-    (0x104A, 0x104F),
-    (0x10FB, 0x10FB),
-    (0x1360, 0x1368),
-    (0x1400, 0x1400),
-    (0x166D, 0x166E),
-    (0x169B, 0x169C),
-    (0x16EB, 0x16ED),
-    (0x1735, 0x1736),
-    (0x17D4, 0x17D6),
-    (0x17D8, 0x17DA),
-    (0x1800, 0x180A),
-    (0x1944, 0x1945),
-    (0x1A1E, 0x1A1F),
-    (0x1AA0, 0x1AA6),
-    (0x1AA8, 0x1AAD),
-    (0x1B5A, 0x1B60),
-    (0x1BFC, 0x1BFF),
-    (0x1C3B, 0x1C3F),
-    (0x1C7E, 0x1C7F),
-    (0x1CC0, 0x1CC7),
-    (0x1CD3, 0x1CD3),
-    (0x2010, 0x2027),
-    (0x2030, 0x2043),
-    (0x2045, 0x2051),
-    (0x2053, 0x205E),
-    (0x207D, 0x207E),
-    (0x208D, 0x208E),
-    (0x2308, 0x230B),
-    (0x2329, 0x232A),
-    (0x2768, 0x2775),
-    (0x27C5, 0x27C6),
-    (0x27E6, 0x27EF),
-    (0x2983, 0x2998),
-    (0x29D8, 0x29DB),
-    (0x29FC, 0x29FD),
-    (0x2CF9, 0x2CFC),
-    (0x2CFE, 0x2CFF),
-    (0x2D70, 0x2D70),
-    (0x2E00, 0x2E2E),
-    (0x2E30, 0x2E42),
-    (0x3001, 0x3003),
-    (0x3008, 0x3011),
-    (0x3014, 0x301F),
-    (0x3030, 0x3030),
-    (0x303D, 0x303D),
-    (0x30A0, 0x30A0),
-    (0x30FB, 0x30FB),
-    (0xA4FE, 0xA4FF),
-    (0xA60D, 0xA60F),
-    (0xA673, 0xA673),
-    (0xA67E, 0xA67E),
-    (0xA6F2, 0xA6F7),
-    (0xA874, 0xA877),
-    (0xA8CE, 0xA8CF),
-    (0xA8F8, 0xA8FA),
-    (0xA92E, 0xA92F),
-    (0xA95F, 0xA95F),
-    (0xA9C1, 0xA9CD),
-    (0xA9DE, 0xA9DF),
-    (0xAA5C, 0xAA5F),
-    (0xAADE, 0xAADF),
-    (0xAAF0, 0xAAF1),
-    (0xABEB, 0xABEB),
-    (0xFD3E, 0xFD3F),
-    (0xFE10, 0xFE19),
-    (0xFE30, 0xFE52),
-    (0xFE54, 0xFE61),
-    (0xFE63, 0xFE63),
-    (0xFE68, 0xFE68),
-    (0xFE6A, 0xFE6B),
-    (0xFF01, 0xFF03),
-    (0xFF05, 0xFF0A),
-    (0xFF0C, 0xFF0F),
-    (0xFF1A, 0xFF1B),
-    (0xFF1F, 0xFF20),
-    (0xFF3B, 0xFF3D),
-    (0xFF3F, 0xFF3F),
-    (0xFF5B, 0xFF5B),
-    (0xFF5D, 0xFF5D),
-    (0xFF5F, 0xFF65),
-    (0x10100, 0x10102),
-    (0x1039F, 0x1039F),
-    (0x103D0, 0x103D0),
-    (0x1056F, 0x1056F),
-    (0x10857, 0x10857),
-    (0x1091F, 0x1091F),
-    (0x1093F, 0x1093F),
-    (0x10A50, 0x10A58),
-    (0x10A7F, 0x10A7F),
-    (0x10AF0, 0x10AF6),
-    (0x10B39, 0x10B3F),
-    (0x10B99, 0x10B9C),
-    (0x11047, 0x1104D),
-    (0x110BB, 0x110BC),
-    (0x110BE, 0x110C1),
-    (0x11140, 0x11143),
-    (0x11174, 0x11175),
-    (0x111C5, 0x111C8),
-    (0x111CD, 0x111CD),
-    (0x11238, 0x1123D),
-    (0x114C6, 0x114C6),
-    (0x115C1, 0x115C9),
-    (0x11641, 0x11643),
-    (0x12470, 0x12474),
-    (0x16A6E, 0x16A6F),
-    (0x16AF5, 0x16AF5),
-    (0x16B37, 0x16B3B),
-    (0x16B44, 0x16B44),
-    (0x1BC9F, 0x1BC9F),
+    (0x00A1, 0x00A1), (0x00A7, 0x00A7), (0x00AB, 0x00AB), (0x00B6, 0x00B7), (0x00BB, 0x00BB), (0x00BF, 0x00BF),
+    (0x037E, 0x037E), (0x0387, 0x0387), (0x055A, 0x055F), (0x0589, 0x058A), (0x05BE, 0x05BE), (0x05C0, 0x05C0),
+    (0x05C3, 0x05C3), (0x05C6, 0x05C6), (0x05F3, 0x05F4), (0x0609, 0x060A), (0x060C, 0x060D), (0x061B, 0x061B),
+    (0x061E, 0x061F), (0x066A, 0x066D), (0x06D4, 0x06D4), (0x0700, 0x070D), (0x07F7, 0x07F9), (0x0830, 0x083E),
+    (0x085E, 0x085E), (0x0964, 0x0965), (0x0970, 0x0970), (0x0AF0, 0x0AF0), (0x0DF4, 0x0DF4), (0x0E4F, 0x0E4F),
+    (0x0E5A, 0x0E5B), (0x0F04, 0x0F12), (0x0F14, 0x0F14), (0x0F3A, 0x0F3D), (0x0F85, 0x0F85), (0x0FD0, 0x0FD4),
+    (0x0FD9, 0x0FDA), (0x104A, 0x104F), (0x10FB, 0x10FB), (0x1360, 0x1368), (0x1400, 0x1400), (0x166D, 0x166E),
+    (0x169B, 0x169C), (0x16EB, 0x16ED), (0x1735, 0x1736), (0x17D4, 0x17D6), (0x17D8, 0x17DA), (0x1800, 0x180A),
+    (0x1944, 0x1945), (0x1A1E, 0x1A1F), (0x1AA0, 0x1AA6), (0x1AA8, 0x1AAD), (0x1B5A, 0x1B60), (0x1BFC, 0x1BFF),
+    (0x1C3B, 0x1C3F), (0x1C7E, 0x1C7F), (0x1CC0, 0x1CC7), (0x1CD3, 0x1CD3), (0x2010, 0x2027), (0x2030, 0x2043),
+    (0x2045, 0x2051), (0x2053, 0x205E), (0x207D, 0x207E), (0x208D, 0x208E), (0x2308, 0x230B), (0x2329, 0x232A),
+    (0x2768, 0x2775), (0x27C5, 0x27C6), (0x27E6, 0x27EF), (0x2983, 0x2998), (0x29D8, 0x29DB), (0x29FC, 0x29FD),
+    (0x2CF9, 0x2CFC), (0x2CFE, 0x2CFF), (0x2D70, 0x2D70), (0x2E00, 0x2E2E), (0x2E30, 0x2E42), (0x3001, 0x3003),
+    (0x3008, 0x3011), (0x3014, 0x301F), (0x3030, 0x3030), (0x303D, 0x303D), (0x30A0, 0x30A0), (0x30FB, 0x30FB),
+    (0xA4FE, 0xA4FF), (0xA60D, 0xA60F), (0xA673, 0xA673), (0xA67E, 0xA67E), (0xA6F2, 0xA6F7), (0xA874, 0xA877),
+    (0xA8CE, 0xA8CF), (0xA8F8, 0xA8FA), (0xA92E, 0xA92F), (0xA95F, 0xA95F), (0xA9C1, 0xA9CD), (0xA9DE, 0xA9DF),
+    (0xAA5C, 0xAA5F), (0xAADE, 0xAADF), (0xAAF0, 0xAAF1), (0xABEB, 0xABEB), (0xFD3E, 0xFD3F), (0xFE10, 0xFE19),
+    (0xFE30, 0xFE52), (0xFE54, 0xFE61), (0xFE63, 0xFE63), (0xFE68, 0xFE68), (0xFE6A, 0xFE6B), (0xFF01, 0xFF03),
+    (0xFF05, 0xFF0A), (0xFF0C, 0xFF0F), (0xFF1A, 0xFF1B), (0xFF1F, 0xFF20), (0xFF3B, 0xFF3D), (0xFF3F, 0xFF3F),
+    (0xFF5B, 0xFF5B), (0xFF5D, 0xFF5D), (0xFF5F, 0xFF65), (0x10100, 0x10102), (0x1039F, 0x1039F), (0x103D0, 0x103D0),
+    (0x1056F, 0x1056F), (0x10857, 0x10857), (0x1091F, 0x1091F), (0x1093F, 0x1093F), (0x10A50, 0x10A58), (0x10A7F, 0x10A7F),
+    (0x10AF0, 0x10AF6), (0x10B39, 0x10B3F), (0x10B99, 0x10B9C), (0x11047, 0x1104D), (0x110BB, 0x110BC), (0x110BE, 0x110C1),
+    (0x11140, 0x11143), (0x11174, 0x11175), (0x111C5, 0x111C8), (0x111CD, 0x111CD), (0x11238, 0x1123D), (0x114C6, 0x114C6),
+    (0x115C1, 0x115C9), (0x11641, 0x11643), (0x12470, 0x12474), (0x16A6E, 0x16A6F), (0x16AF5, 0x16AF5), (0x16B37, 0x16B3B),
+    (0x16B44, 0x16B44), (0x1BC9F, 0x1BC9F),
 ];
 
 /// The character before `ix` in a subject that starts at `start`, as
@@ -446,9 +326,48 @@ fn link_label(input: &[u8], mut p: usize, attribute: bool) -> Option<(Range<usiz
     }
 }
 
-/// Whether a label has anything but whitespace (`cmark_chunk_trim`, then a
+/// `link_label` for a link label at `p`: its contents and the offset after
+/// its `]`.
+pub(crate) fn link_label_at(input: &[u8], p: usize) -> Option<(Range<usize>, usize)> {
+    link_label(input, p, false)
+}
+
+/// `manual_scan_attribute_attributes`: the length of an inline attribute
+/// span's attributes from `offset`, up to the `)` that closes them.
+/// Parentheses nest (at most 32 deep) and backslashes escape punctuation;
+/// unlike a link destination, spaces and line endings are allowed.
+pub(crate) fn scan_attributes(input: &[u8], offset: usize) -> Option<usize> {
+    let mut i = offset;
+    let mut parens = 0;
+    while i < input.len() {
+        match input[i] {
+            b'\\' if i + 1 < input.len() && input[i + 1].is_ascii_punctuation() => i += 2,
+            b'(' => {
+                parens += 1;
+                i += 1;
+                if parens > 32 {
+                    return None;
+                }
+            }
+            b')' => {
+                if parens == 0 {
+                    break;
+                }
+                parens -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if i >= input.len() {
+        return None;
+    }
+    Some(i - offset)
+}
+
+/// Whether a label has nothing but whitespace (`cmark_chunk_trim`, then a
 /// test for emptiness).
-fn label_is_empty(label: &[u8]) -> bool {
+pub(crate) fn label_is_blank(label: &[u8]) -> bool {
     label.iter().all(|&b| is_cmark_space_byte(b))
 }
 
@@ -577,24 +496,66 @@ pub(crate) fn scan_link_title(input: &[u8], p: usize) -> usize {
 /// The key pulldown-cmark looks a label up by (its whitespace collapsed,
 /// case-folded by `UniCase`), for a label found by `link_label`.
 pub(crate) fn label_key(content: &[u8], label: Range<usize>) -> Option<LinkLabel<'static>> {
-    let text = std::str::from_utf8(&content[label.start..label.end + 1]).ok()?;
-    let (_, key) = scan_link_label_rest(text, &|_| Some(0), false)?;
-    Some(UniCase::new(CowStr::from(key.into_string())))
+    label_key_with(content, label, &|_| Some(0)).map(UniCase::new)
 }
 
-/// `cmark_clean_url` and `cmark_clean_title`'s unescaping: entities first
-/// (`houdini_unescape_html_f`), then backslash escapes in the result
-/// (`cmark_strbuf_unescape`), so `\\&amp;` becomes `&`.
-pub(crate) fn clean(text: &str) -> String {
+/// `label_key` in text where `skip_prefix` measures the container prefix
+/// after a line ending. `content[label.end]` is the `]` after the label.
+pub(crate) fn label_key_with(
+    content: &[u8],
+    label: Range<usize>,
+    skip_prefix: &dyn Fn(&[u8]) -> Option<usize>,
+) -> Option<CowStr<'static>> {
+    if label.len() > MAX_LINK_LABEL_LENGTH {
+        return None;
+    }
+    let text = std::str::from_utf8(&content[label.start..label.end + 1]).ok()?;
+    let (_, key) = scan_link_label_rest(text, skip_prefix, false)?;
+    Some(CowStr::from(key.into_string()))
+}
+
+/// `houdini_unescape_ent` for an entity at `bytes[0]` (`&`): numeric
+/// references take up to 8 digits, decimal or hexadecimal, where
+/// CommonMark 0.31 allows 7 and 6. Returns its length and its value.
+pub(crate) fn scan_entity(bytes: &[u8]) -> (usize, Option<CowStr<'static>>) {
+    if bytes.get(1) != Some(&b'#') {
+        return scanners::scan_entity(bytes);
+    }
+    let hex = matches!(bytes.get(2), Some(b'x' | b'X'));
+    let digits_start = if hex { 3 } else { 2 };
+    let mut codepoint: u32 = 0;
+    let mut i = digits_start;
+    while let Some(&b) = bytes.get(i) {
+        let digit = match b {
+            b'0'..=b'9' => u32::from(b - b'0'),
+            b'a'..=b'f' | b'A'..=b'F' if hex => u32::from((b | 0x20) - b'a' + 10),
+            _ => break,
+        };
+        codepoint = (codepoint * if hex { 16 } else { 10 } + digit).min(0x110000);
+        i += 1;
+    }
+    let digits = i - digits_start;
+    if !(1..=8).contains(&digits) || bytes.get(i) != Some(&b';') {
+        return (0, None);
+    }
+    let value = match codepoint {
+        0 | 0xD800..=0xDFFF | 0x110000.. => '\u{FFFD}',
+        _ => char::from_u32(codepoint).unwrap_or('\u{FFFD}'),
+    };
+    (i + 1, Some(value.into()))
+}
+
+/// `houdini_unescape_html_f`: entities decoded.
+fn decode_entities(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut entities = String::with_capacity(text.len());
+    let mut decoded = String::with_capacity(text.len());
     let mut mark = 0;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'&' {
             if let (n, Some(value)) = scan_entity(&bytes[i..]) {
-                entities.push_str(&text[mark..i]);
-                entities.push_str(&value);
+                decoded.push_str(&text[mark..i]);
+                decoded.push_str(&value);
                 i += n;
                 mark = i;
                 continue;
@@ -602,9 +563,14 @@ pub(crate) fn clean(text: &str) -> String {
         }
         i += 1;
     }
-    entities.push_str(&text[mark..]);
-    let mut result = String::with_capacity(entities.len());
-    let mut characters = entities.chars().peekable();
+    decoded.push_str(&text[mark..]);
+    decoded
+}
+
+/// `cmark_strbuf_unescape`: a backslash before ASCII punctuation dropped.
+fn unescape_backslashes(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
     while let Some(c) = characters.next() {
         match characters.peek() {
             Some(&escaped) if c == '\\' && escaped.is_ascii_punctuation() => {
@@ -617,9 +583,26 @@ pub(crate) fn clean(text: &str) -> String {
     result
 }
 
+/// `cmark_strbuf_trim`'s characters.
+fn trim_cmark_space(text: &str) -> &str {
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'))
+}
+
+/// `cmark_clean_url` and `cmark_clean_title`'s unescaping: entities first,
+/// then backslash escapes in the result, so `\\&amp;` becomes `&`.
+pub(crate) fn clean(text: &str) -> String {
+    unescape_backslashes(&decode_entities(text))
+}
+
+/// A fenced code block's info string as cmark's `finalize` makes it:
+/// entities decoded, then trimmed, then backslash escapes removed.
+pub(crate) fn clean_info(text: &str) -> String {
+    unescape_backslashes(trim_cmark_space(&decode_entities(text)))
+}
+
 /// `cmark_clean_url`: trimmed, then unescaped.
 pub(crate) fn clean_url(text: &str) -> String {
-    clean(text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')))
+    clean(trim_cmark_space(text))
 }
 
 /// An inline link's `(destination "title")` at `ix` (the `(`), as
@@ -674,7 +657,7 @@ pub(crate) enum Definition {
 /// `cmark_parse_reference_inline`: a link reference definition at `p`.
 fn reference_definition(input: &[u8], p: usize) -> Option<(usize, Definition)> {
     let (label, mut p) = link_label(input, p, false)?;
-    if label_is_empty(&input[label.clone()]) || input.get(p) != Some(&b':') {
+    if label_is_blank(&input[label.clone()]) || input.get(p) != Some(&b':') {
         return None;
     }
     p = spnl(input, p + 1);
@@ -713,7 +696,7 @@ fn reference_definition(input: &[u8], p: usize) -> Option<(usize, Definition)> {
 /// (swift-cmark's inline attributes).
 fn attributes_definition(input: &[u8], p: usize) -> Option<(usize, Definition)> {
     let (label, mut p) = link_label(input, p, true)?;
-    if label_is_empty(&input[label.clone()]) || input.get(p) != Some(&b':') {
+    if label_is_blank(&input[label.clone()]) || input.get(p) != Some(&b':') {
         return None;
     }
     p = spnl(input, p + 1);
@@ -1207,6 +1190,47 @@ pub(crate) fn html_block_ends(kind: u8, line: &[u8]) -> bool {
         4 => contains(b">"),
         5 => contains(b"]]>"),
         _ => false,
+    }
+}
+
+/// `scan_close_code_fence`: at least `length` fence characters, then only
+/// spaces and tabs (CommonMark 0.31 allows only spaces). Returns the length
+/// of the fence and its spaces.
+pub(crate) fn closing_code_fence(bytes: &[u8], fence: u8, length: usize) -> Option<usize> {
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let fences = bytes.iter().take_while(|&&b| b == fence).count();
+    if fences < length {
+        return None;
+    }
+    let spaces = bytes[fences..]
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    let end = fences + spaces;
+    matches!(bytes.get(end), None | Some(b'\n' | b'\r')).then_some(end)
+}
+
+/// `chop_trailing_hashtags` on a line (without its line ending): the length
+/// left once trailing whitespace goes, and then a closing sequence of `#`s
+/// after a space or tab, and the whitespace before it.
+pub(crate) fn chop_trailing_hashtags(line: &[u8]) -> usize {
+    let rtrim = |mut len: usize| {
+        while len > 0 && is_cmark_space_byte(line[len - 1]) {
+            len -= 1;
+        }
+        len
+    };
+    let len = rtrim(line.len());
+    let mut n = len;
+    while n > 0 && line[n - 1] == b'#' {
+        n -= 1;
+    }
+    if n != len && n > 0 && matches!(line[n - 1], b' ' | b'\t') {
+        rtrim(n - 1)
+    } else {
+        len
     }
 }
 

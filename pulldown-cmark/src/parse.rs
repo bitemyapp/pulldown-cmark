@@ -69,6 +69,8 @@ pub(crate) enum ItemBody {
     // bool indicates whether or not the preceding section could be a reference
     MaybeLinkClose(bool),
     MaybeImage,
+    /// `^[`, swift-cmark's inline attributes opener (cmark-gfm compat only).
+    MaybeAttributes,
 
     // These are inline items after resolution.
     Emphasis,
@@ -142,6 +144,7 @@ impl ItemBody {
                 | MaybeLinkOpen
                 | MaybeLinkClose(..)
                 | MaybeImage
+                | MaybeAttributes
         )
     }
     fn is_inline(&self) -> bool {
@@ -156,6 +159,7 @@ impl ItemBody {
                 | MaybeLinkOpen
                 | MaybeLinkClose(..)
                 | MaybeImage
+                | MaybeAttributes
                 | Emphasis
                 | Strong
                 | Strikethrough
@@ -637,11 +641,13 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         self.wikilink_stack.push(LinkStackEl {
                             node: cur_ix,
                             ty: LinkStackTy::Link,
+                            bracket_after: false,
                         });
                     }
                     self.link_stack.push(LinkStackEl {
                         node: cur_ix,
                         ty: LinkStackTy::Link,
+                        bracket_after: false,
                     });
                 }
                 ItemBody::MaybeImage => {
@@ -656,11 +662,24 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         self.wikilink_stack.push(LinkStackEl {
                             node: cur_ix,
                             ty: LinkStackTy::Image,
+                            bracket_after: false,
                         });
                     }
                     self.link_stack.push(LinkStackEl {
                         node: cur_ix,
                         ty: LinkStackTy::Image,
+                        bracket_after: false,
+                    });
+                }
+                ItemBody::MaybeAttributes => {
+                    self.tree[cur_ix].item.body = ItemBody::Text {
+                        backslash_escaped: false,
+                    };
+                    self.cmark_no_link_openers = false;
+                    self.link_stack.push(LinkStackEl {
+                        node: cur_ix,
+                        ty: LinkStackTy::Attributes,
+                        bracket_after: false,
                     });
                 }
                 ItemBody::MaybeLinkClose(could_be_ref) => {
@@ -668,6 +687,21 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         backslash_escaped: false,
                     };
                     let tos_link = self.link_stack.pop();
+                    if let Some(tos) = tos_link
+                        .as_ref()
+                        .filter(|tos| tos.ty == LinkStackTy::Attributes)
+                    {
+                        let open = tos.node;
+                        if let Some(node) =
+                            self.close_cmark_attributes(block_text, open, cur_ix, prev)
+                        {
+                            cur = Some(node);
+                            cur_ix = node;
+                        }
+                        prev = cur;
+                        cur = self.tree[cur_ix].next;
+                        continue;
+                    }
                     if self.options.contains(Options::ENABLE_WIKILINKS)
                         && self.tree[cur_ix]
                             .next
@@ -701,11 +735,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         }
                         let next = self.tree[cur_ix].next;
                         let inline_link = if compat {
-                            self.scan_inline_link_cmark(
-                                block_text,
-                                self.tree[cur_ix].item.end,
-                                next,
-                            )
+                            self.scan_inline_link_cmark(block_text, self.tree[cur_ix].item.end)
                         } else {
                             self.scan_inline_link(block_text, self.tree[cur_ix].item.end, next)
                         };
@@ -734,6 +764,37 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
 
                             if tos.ty == LinkStackTy::Link {
                                 self.disable_all_links();
+                            }
+                        } else if compat {
+                            // cmark-gfm's reference lookup.
+                            if let Some((end, link_type, url, title, id)) =
+                                self.cmark_reference(block_text, &tos, cur_ix)
+                            {
+                                let node_after_link = scan_nodes_to_ix(&self.tree, next, end);
+                                if let Some(node_ix) = node_after_link {
+                                    self.tree[node_ix].item.start =
+                                        max(self.tree[node_ix].item.start, end);
+                                }
+                                let link_ix = self.allocs.allocate_link(link_type, url, title, id);
+                                self.tree[tos.node].item.body = if tos.ty == LinkStackTy::Image {
+                                    ItemBody::Image(link_ix)
+                                } else {
+                                    ItemBody::Link(link_ix)
+                                };
+                                let label_node = self.tree[tos.node].next;
+                                self.tree[tos.node].next = node_after_link;
+                                if label_node != cur {
+                                    self.tree[tos.node].child = label_node;
+                                    if let Some(prev_ix) = prev {
+                                        self.tree[prev_ix].next = None;
+                                    }
+                                }
+                                self.tree[tos.node].item.end = end;
+                                cur = Some(tos.node);
+                                cur_ix = tos.node;
+                                if tos.ty == LinkStackTy::Link {
+                                    self.disable_all_links();
+                                }
                             }
                         } else {
                             // ok, so its not an inline link. maybe it is a reference
@@ -1222,12 +1283,114 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         Some((ix, dest, title))
     }
 
+    /// swift-cmark's `handle_close_bracket_attribute`, for the `]` at `close`
+    /// whose opener is the `^[` at `open`: `(attributes)` and then a
+    /// `[label]` naming an attribute definition make an attribute span. A
+    /// label that names none is dropped with the `]` left as text, as cmark
+    /// does. Returns the span's node.
+    fn close_cmark_attributes(
+        &mut self,
+        block_text: &'input str,
+        open: TreeIndex,
+        close: TreeIndex,
+        prev: Option<TreeIndex>,
+    ) -> Option<TreeIndex> {
+        let bytes = block_text.as_bytes();
+        let close_end = self.tree[close].item.end;
+        let mut end = close_end;
+        let mut attributes = None;
+        if bytes.get(end) == Some(&b'(') {
+            if let Some(length) = cmark_compat::scan_attributes(bytes, end + 1) {
+                let range = end + 1..end + 1 + length;
+                attributes = Some(CowStr::from(self.cmark_subject_text(block_text, range)));
+                end += length + 2;
+            }
+        }
+        if let Some((label, after)) = cmark_compat::link_label_at(bytes, end) {
+            end = after;
+            if let Some(value) = cmark_compat::label_key(bytes, label)
+                .and_then(|key| self.allocs.cmark_attributes.get(&key))
+            {
+                attributes = Some(value.clone());
+            }
+        }
+        let next = self.tree[close].next;
+        let next_node = scan_nodes_to_ix(&self.tree, next, end);
+        if let Some(node_ix) = next_node {
+            self.tree[node_ix].item.start = max(self.tree[node_ix].item.start, end);
+        }
+        let Some(attributes) = attributes else {
+            // The `]` stays text; a label after it is gone, and cmark places
+            // the `]` where the label ended (its own `]`).
+            self.tree[close].next = next_node;
+            if end > close_end {
+                self.tree[close].item.start = end - 1;
+                self.tree[close].item.end = end;
+            }
+            return None;
+        };
+        if let Some(prev_ix) = prev {
+            self.tree[prev_ix].next = None;
+        }
+        let link_ix =
+            self.allocs
+                .allocate_link(LinkType::InlineAttributes, attributes, "".into(), "".into());
+        self.tree[open].item.body = ItemBody::Link(link_ix);
+        self.tree[open].child = self.tree[open].next;
+        self.tree[open].next = next_node;
+        self.tree[open].item.end = end;
+        Some(open)
+    }
+
+    /// The reference part of cmark-gfm's `handle_close_bracket` for the `]`
+    /// at `close`: a `[label]` right after it names the reference; an empty
+    /// one, or none, makes the link text the label unless a bracket opened
+    /// inside it. Returns the end of the link, its type, destination, title
+    /// and label.
+    #[allow(clippy::type_complexity)]
+    fn cmark_reference(
+        &mut self,
+        block_text: &'input str,
+        opener: &LinkStackEl,
+        close: TreeIndex,
+    ) -> Option<(
+        usize,
+        LinkType,
+        CowStr<'input>,
+        CowStr<'input>,
+        CowStr<'input>,
+    )> {
+        let bytes = block_text.as_bytes();
+        let after = self.tree[close].item.end;
+        let label_after = cmark_compat::link_label_at(bytes, after);
+        let end = label_after.as_ref().map_or(after, |(_, end)| *end);
+        let (label, link_type) = match label_after {
+            Some((label, _)) if !cmark_compat::label_is_blank(&bytes[label.clone()]) => {
+                (label, LinkType::Reference)
+            }
+            _ if opener.bracket_after => return None,
+            Some(_) => (
+                self.tree[opener.node].item.end..self.tree[close].item.start,
+                LinkType::Collapsed,
+            ),
+            None => (
+                self.tree[opener.node].item.end..self.tree[close].item.start,
+                LinkType::Shortcut,
+            ),
+        };
+        let handler = |bytes: &[u8]| Some(skip_container_prefixes(&self.tree, bytes, self.options));
+        let key = cmark_compat::label_key_with(bytes, label, &handler)?;
+        let span = self.tree[opener.node].item.start..end;
+        let (link_type, url, title) =
+            self.fetch_link_type_url_title(key.clone(), span, link_type)?;
+        Some((end, link_type, url, title, key))
+    }
+
     /// `scan_inline_link` as cmark-gfm's `handle_close_bracket` scans it.
     fn scan_inline_link_cmark(
         &self,
         underlying: &'input str,
         ix: usize,
-        node: Option<TreeIndex>,
     ) -> Option<(usize, CowStr<'input>, CowStr<'input>)> {
         let bytes = underlying.as_bytes();
         let step = |i: usize| match bytes[i] {
@@ -1241,32 +1404,39 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         let url = cmark_compat::clean_url(&underlying[url]);
         let title = match title {
             None => String::new(),
-            Some(title) => {
-                // The title's text as in cmark's subject: from each line
-                // after the first, what the line's first node starts with.
-                let mut text = String::new();
-                let mut mark = title.start + 1;
-                let mut i = mark;
-                while i < title.end - 1 {
-                    if bytes[i] == b'\n' || bytes[i] == b'\r' {
-                        if let Some(node_ix) = scan_nodes_to_ix(&self.tree, node, i + 1) {
-                            let start = self.tree[node_ix].item.start;
-                            if start > i && start < title.end {
-                                text.push_str(&underlying[mark..i]);
-                                text.push('\n');
-                                i = start;
-                                mark = i;
-                                continue;
-                            }
-                        }
-                    }
-                    i += 1;
-                }
-                text.push_str(&underlying[mark..title.end - 1]);
-                cmark_compat::clean(&text)
-            }
+            Some(title) => cmark_compat::clean(
+                &self.cmark_subject_text(underlying, title.start + 1..title.end - 1),
+            ),
         };
         Some((end, url.into(), title.into()))
+    }
+
+    /// The text of `range` as in cmark's subject: each line after the first
+    /// without its container prefix, and without its indentation unless it
+    /// is a lazy continuation line.
+    fn cmark_subject_text(&self, underlying: &'input str, range: Range<usize>) -> String {
+        let bytes = underlying.as_bytes();
+        let mut text = String::new();
+        let mut mark = range.start;
+        let mut i = mark;
+        while i < range.end {
+            if let Some(eol) = scan_eol(&bytes[i..]).filter(|&eol| eol > 0) {
+                text.push_str(&underlying[mark..i]);
+                text.push('\n');
+                let line = i + eol;
+                let mut line_start = LineStart::new(&bytes[line..]);
+                let matched = scan_containers(&self.tree, &mut line_start, self.options);
+                if matched == self.tree.spine_len() {
+                    line_start.scan_all_space();
+                }
+                i = (line + line_start.bytes_scanned()).min(range.end);
+                mark = i;
+                continue;
+            }
+            i += 1;
+        }
+        text.push_str(&underlying[mark..range.end]);
+        text
     }
 
     // returns (bytes scanned, title cow)
@@ -1885,6 +2055,9 @@ struct LinkStack {
 
 impl LinkStack {
     fn push(&mut self, el: LinkStackEl) {
+        if let Some(top) = self.inner.last_mut() {
+            top.bracket_after = true;
+        }
         self.inner.push(el);
     }
 
@@ -1913,6 +2086,9 @@ impl LinkStack {
 struct LinkStackEl {
     node: TreeIndex,
     ty: LinkStackTy,
+    /// cmark's `bracket_after`: a bracket was pushed while this one was on
+    /// top, so it cannot be a shortcut or collapsed reference.
+    bracket_after: bool,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -1920,6 +2096,8 @@ enum LinkStackTy {
     Link,
     Image,
     Disabled,
+    /// swift-cmark's `ATTRIBUTE` bracket.
+    Attributes,
 }
 
 /// Contains the destination URL, title and source span of a reference definition.

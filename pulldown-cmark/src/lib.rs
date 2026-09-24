@@ -495,6 +495,11 @@ pub enum LinkType {
     Autolink,
     /// Email address in autolink like `<john@example.org>`
     Email,
+    /// swift-cmark's inline attributes, `^[text](attributes)` or
+    /// `^[text][label]` with an attribute definition `^[label]: attributes`.
+    /// Only with `Options::ENABLE_CMARK_GFM_COMPAT`; `dest_url` holds the
+    /// attributes.
+    InlineAttributes,
     /// Wikilink link like `[[foo]]` or `[[foo|bar]]`
     WikiLink {
         /// `true` if the wikilink was piped.

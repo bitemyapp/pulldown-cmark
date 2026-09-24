@@ -51,6 +51,8 @@ struct HtmlWriter<'a, I, W> {
     table_alignments: Vec<Alignment>,
     table_cell_index: usize,
     numbers: HashMap<CowStr<'a>, usize>,
+    /// For each open link, whether it is an attribute span.
+    link_spans: Vec<bool>,
 }
 
 impl<'a, I, W> HtmlWriter<'a, I, W>
@@ -68,6 +70,7 @@ where
             table_alignments: vec![],
             table_cell_index: 0,
             numbers: HashMap::new(),
+            link_spans: Vec::new(),
         }
     }
 
@@ -341,11 +344,22 @@ where
                 self.write("\">")
             }
             Tag::Link {
+                link_type: LinkType::InlineAttributes,
+                dest_url,
+                ..
+            } => {
+                self.link_spans.push(true);
+                self.write("<span data-attributes=\"")?;
+                escape_html(&mut self.writer, &dest_url)?;
+                self.write("\">")
+            }
+            Tag::Link {
                 link_type: _,
                 dest_url,
                 title,
                 id: _,
             } => {
+                self.link_spans.push(false);
                 self.write("<a href=\"")?;
                 escape_href(&mut self.writer, &dest_url)?;
                 if !title.is_empty() {
@@ -462,7 +476,11 @@ where
                 self.write("</del>")?;
             }
             TagEnd::Link => {
-                self.write("</a>")?;
+                if self.link_spans.pop() == Some(true) {
+                    self.write("</span>")?;
+                } else {
+                    self.write("</a>")?;
+                }
             }
             TagEnd::Image => (), // shouldn't happen, handled in start
             TagEnd::FootnoteDefinition => {
