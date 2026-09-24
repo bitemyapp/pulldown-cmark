@@ -85,6 +85,7 @@ pub mod html;
 
 pub mod utils;
 
+mod cmark_compat;
 mod entities;
 mod firstpass;
 mod linklabel;
@@ -733,10 +734,22 @@ bitflags::bitflags! {
         const ENABLE_SUBSCRIPT = 1 << 14;
         /// Obsidian-style Wikilinks.
         const ENABLE_WIKILINKS = 1 << 15;
+        /// Parse as cmark-gfm 0.29.0.gfm.13 does (CommonMark 0.29 plus the
+        /// GFM `table`, `strikethrough` and `tasklist` extensions) wherever
+        /// it and this parser disagree: delimiter flanking and matching,
+        /// strikethrough, code spans, link destinations, HTML, tables, task
+        /// items and a few list and reference-definition rules. Meant to be
+        /// used with `ENABLE_TABLES`, `ENABLE_STRIKETHROUGH` and
+        /// `ENABLE_TASKLISTS`. `UPLEFT.md` lists every difference.
+        const ENABLE_CMARK_GFM_COMPAT = 1 << 16;
     }
 }
 
 impl Options {
+    pub(crate) fn cmark_gfm_compat(&self) -> bool {
+        self.contains(Options::ENABLE_CMARK_GFM_COMPAT)
+    }
+
     pub(crate) fn has_gfm_footnotes(&self) -> bool {
         self.contains(Options::ENABLE_FOOTNOTES) && !self.contains(Options::ENABLE_OLD_FOOTNOTES)
     }

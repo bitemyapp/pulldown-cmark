@@ -176,6 +176,27 @@ impl<T: Default> Tree<T> {
         self.cur
     }
 
+    /// Drops the current parent's children after `last` (all of them when
+    /// `last` is `None`) and focuses `last`.
+    pub(crate) fn truncate_after(&mut self, last: Option<TreeIndex>) {
+        match last {
+            Some(ix) => self[ix].next = None,
+            None => {
+                if let Some(&parent) = self.spine.last() {
+                    self[parent].child = None;
+                }
+            }
+        }
+        self.cur = last;
+    }
+
+    /// Removes node `ix` and every node created after it (the last
+    /// children appended), leaving `last` as the focused last child.
+    pub(crate) fn remove_trailing_nodes(&mut self, ix: TreeIndex, last: Option<TreeIndex>) {
+        self.nodes.truncate(ix.get());
+        self.truncate_after(last);
+    }
+
     pub(crate) fn truncate_to_parent(&mut self, child_ix: TreeIndex) {
         let next = self[child_ix].next;
         self[child_ix].next = None;

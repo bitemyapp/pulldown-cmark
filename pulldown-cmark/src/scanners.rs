@@ -259,6 +259,12 @@ impl<'a> LineStart<'a> {
         tag
     }
 
+    /// Whether the last space scanned was part of a tab that reaches past
+    /// the columns asked for.
+    pub(crate) fn has_partial_tab(&self) -> bool {
+        self.spaces_remaining > 0
+    }
+
     pub(crate) fn scan_blockquote_marker(&mut self) -> bool {
         if self.scan_ch(b'>') {
             let _ = self.scan_space(1);
