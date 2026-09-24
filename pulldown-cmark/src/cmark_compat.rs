@@ -155,6 +155,9 @@ pub(crate) const MAX_TILDE_RUN: usize = 100;
 
 // MARK: Tables
 
+/// The table extension's `MAX_AUTOCOMPLETED_CELLS`.
+pub(crate) const MAX_AUTOCOMPLETED_CELLS: usize = 0x80000;
+
 /// `spacechar` in the table extension's scanners.
 fn is_table_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | 0x0B | 0x0C)
@@ -163,7 +166,7 @@ fn is_table_space(byte: u8) -> bool {
 /// The length of a line's content: up to its line ending or the end of
 /// the text. cmark ends every line with a newline, so the end of the text
 /// reads as one.
-fn line_content_len(line: &[u8]) -> usize {
+pub(crate) fn line_content_len(line: &[u8]) -> usize {
     memchr::memchr2(b'\n', b'\r', line).unwrap_or(line.len())
 }
 

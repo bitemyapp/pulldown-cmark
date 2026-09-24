@@ -33,6 +33,7 @@ pub(crate) fn run_first_pass(text: &str, options: Options) -> (Tree<Item>, Alloc
         begin_list_item: None,
         cmark_empty_item_blank: false,
         cmark_item_emptied: false,
+        cmark_header_after_tab: false,
         last_line_blank: false,
         allocs: Allocations::new(),
         options,
@@ -65,6 +66,9 @@ struct FirstPass<'a, 'b> {
     /// cmark-gfm: a list item's only paragraph turned out to be all
     /// definitions; the blank line that ended it still found it there.
     cmark_item_emptied: bool,
+    /// cmark-gfm: the table header about to be parsed starts after a partly
+    /// consumed tab.
+    cmark_header_after_tab: bool,
     last_line_blank: bool,
     allocs: Allocations<'a>,
     options: Options,
@@ -114,7 +118,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         }
 
         // Process new containers
+        // cmark-gfm opens a list item only in the first 99 containers a line
+        // opens (`MAX_LIST_DEPTH`).
+        let mut cmark_depth = 0;
         loop {
+            cmark_depth += 1;
             let save = line_start.clone();
             let outer_indent = line_start.scan_space_upto(4);
             if outer_indent >= 4 {
@@ -136,8 +144,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 }
             }
             let container_start = start_ix + line_start.bytes_scanned();
-            if let Some((ch, index, indent)) = line_start.scan_list_marker_with_indent(outer_indent)
-            {
+            let list_marker = if self.options.cmark_gfm_compat() && cmark_depth >= 100 {
+                None
+            } else {
+                line_start.scan_list_marker_with_indent(outer_indent)
+            };
+            if let Some((ch, index, indent)) = list_marker {
                 let after_marker_index = start_ix + line_start.bytes_scanned();
                 let mut item_start = container_start - outer_indent;
                 if self.options.cmark_gfm_compat() {
@@ -568,8 +580,13 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         });
         self.tree.push();
 
+        let mut after_tab = std::mem::take(&mut self.cmark_header_after_tab);
         loop {
-            ix += scan_ch(&bytes[ix..], b'|');
+            // cmark-gfm: a header line starting with the spaces of a partly
+            // consumed tab has no leading pipe.
+            if !std::mem::take(&mut after_tab) {
+                ix += scan_ch(&bytes[ix..], b'|');
+            }
             let start_ix = ix;
             ix += scan_whitespace_no_nl(&bytes[ix..]);
 
@@ -607,7 +624,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // note: this is where GFM and commonmark-extra diverge. we follow
         // GFM here
         for _ in cells..row_cells {
-            if *missing_empty_cells >= MAX_AUTOCOMPLETED_CELLS {
+            if *missing_empty_cells >= MAX_AUTOCOMPLETED_CELLS && !self.options.cmark_gfm_compat() {
                 return None;
             }
             *missing_empty_cells += 1;
@@ -643,6 +660,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             return None;
         }
         let compat = self.options.cmark_gfm_compat();
+        if compat && *missing_empty_cells > cmark_compat::MAX_AUTOCOMPLETED_CELLS {
+            // cmark-gfm takes no more rows once the table has this many
+            // autocompleted cells.
+            return None;
+        }
         if compat && line_start.clone().scan_space(4) {
             // cmark-gfm: an indented line starts a code block, ending the
             // table (a blank one ends it anyway).
@@ -712,6 +734,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         // first non-space character, but a lazy continuation line keeps its
         // indentation.
         let mut line_content = start_ix;
+        // Spaces cmark puts first on a lazy line for a tab the containers'
+        // prefixes partly consumed.
+        let mut line_lead = 0;
         // cmark-gfm resolves link reference definitions (and swift-cmark's
         // attribute definitions) at the start of a paragraph when it ends or
         // becomes a setext heading, not when it becomes a table. Until then
@@ -728,7 +753,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 };
             let (next_ix, brk) = self.parse_line(ix, None, scan_mode);
             if let Some(lines) = &mut definition_lines {
-                lines.push((line_content, next_ix));
+                lines.push((line_content, next_ix, line_lead));
             }
 
             // break out when we find a table
@@ -757,6 +782,9 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             let tree_position = scan_containers(&self.tree, &mut line_start, self.options);
             let current_container = tree_position == self.tree.spine_len();
             let prefix_end = ix + line_start.bytes_scanned();
+            let prefix_tab = line_start
+                .has_partial_tab()
+                .then(|| line_start.remaining_space());
             let trailing_backslash_pos = match brk {
                 Some(Item {
                     start,
@@ -773,7 +801,10 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     && scan_setext_heading(&bytes[ix_new..]).is_some()
                 {
                     let lines = definition_lines.take().unwrap();
-                    if self.cmark_resolve_definitions(node_ix, &lines).is_none() {
+                    if self
+                        .cmark_resolve_definitions(node_ix, &lines, true)
+                        .is_none()
+                    {
                         // Nothing but definitions: no heading; the underline
                         // is the paragraph's first line, and no other block
                         // can start on it.
@@ -808,8 +839,17 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 }
                 if compat && current_container && !table_visited && !restarted {
                     if let Some(alignment) = cmark_compat::table_delimiter_row(suffix) {
-                        if cmark_compat::table_row_cells(&bytes[line_content..]) == alignment.len()
-                        {
+                        let header_cells = if line_lead > 0 {
+                            // The rest of a partly consumed tab starts the line.
+                            let mut line = vec![b' '];
+                            let rest = &bytes[line_content..];
+                            line.extend_from_slice(&rest[..cmark_compat::line_content_len(rest)]);
+                            cmark_compat::table_row_cells(&line)
+                        } else {
+                            cmark_compat::table_row_cells(&bytes[line_content..])
+                        };
+                        if header_cells == alignment.len() {
+                            self.cmark_header_after_tab = line_lead > 0;
                             return self.cmark_table_from_paragraph(
                                 node_ix,
                                 line_content,
@@ -832,6 +872,21 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             previous_line = Some((self.tree.cur(), next_ix, trailing_backslash_pos));
             ix = next_ix + line_start.bytes_scanned();
             line_content = if current_container { ix } else { prefix_end };
+            line_lead = if current_container {
+                0
+            } else {
+                prefix_tab.unwrap_or(0)
+            };
+            if compat && !current_container {
+                // cmark's offset is on a partly consumed tab.
+                let offset = prefix_end - usize::from(prefix_tab.is_some());
+                if let Some(skip) = self.cmark_lazy_task_line(tree_position, offset) {
+                    line_lead = 0;
+                    // The line's text starts 3 bytes on, as cmark's does.
+                    line_content = skip;
+                    ix = ix.max(skip + scan_while(&bytes[skip..], |b| b == b' ' || b == b'\t'));
+                }
+            }
             if restarted {
                 previous_line = None;
             } else if let Some(item) = brk {
@@ -840,7 +895,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         }
 
         let remaining = match definition_lines {
-            Some(lines) => self.cmark_resolve_definitions(node_ix, &lines),
+            Some(lines) => self.cmark_resolve_definitions(node_ix, &lines, false),
             None => Some(start_ix),
         };
         self.pop(ix);
@@ -863,14 +918,74 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         ix
     }
 
+    /// cmark-gfm's tasklist extension on a lazy continuation line whose
+    /// innermost matched container is a list item: when the whole line
+    /// matches the task pattern, that item becomes a task, checked by this
+    /// line, and cmark moves on 3 bytes before taking the line as paragraph
+    /// text. Returns where the text then starts.
+    fn cmark_lazy_task_line(&mut self, tree_position: usize, offset: usize) -> Option<usize> {
+        let prefix_end = offset;
+        let item = *self.tree.walk_spine().nth(tree_position.checked_sub(1)?)?;
+        if !matches!(self.tree[item].item.body, ItemBody::ListItem(_)) {
+            return None;
+        }
+        let bytes = self.text.as_bytes();
+        let line = cmark_compat::line_around(bytes, prefix_end);
+        if !cmark_compat::is_task_line(line) {
+            return None;
+        }
+        let checked = ItemBody::TaskListMarker(cmark_compat::task_line_checked(line));
+        // The item's box follows the last such line: update the boxes it has,
+        // then add one placed on this line, so the adapter can tell where
+        // cmark skipped.
+        // A box on the item's first line may sit in its first paragraph.
+        let mut parent = item;
+        if let Some(first) = self.tree[item].child {
+            if matches!(self.tree[first].item.body, ItemBody::Paragraph)
+                && self.tree[first]
+                    .child
+                    .is_some_and(|c| matches!(self.tree[c].item.body, ItemBody::TaskListMarker(_)))
+            {
+                parent = first;
+            }
+        }
+        let mut last_marker = None;
+        let mut child = self.tree[parent].child;
+        while let Some(c) = child {
+            if !matches!(self.tree[c].item.body, ItemBody::TaskListMarker(_)) {
+                break;
+            }
+            self.tree[c].item.body = checked;
+            last_marker = Some(c);
+            child = self.tree[c].next;
+        }
+        let marker = self.tree.create_node(Item {
+            start: prefix_end,
+            end: prefix_end + 3,
+            body: checked,
+        });
+        self.tree[marker].next = child;
+        match last_marker {
+            Some(previous) => self.tree[previous].next = Some(marker),
+            None => self.tree[parent].child = Some(marker),
+        }
+        let line_end = prefix_end + cmark_compat::line_content_len(&bytes[prefix_end..]);
+        Some((prefix_end + 3).min(line_end))
+    }
+
     /// cmark-gfm's `resolve_reference_link_definitions`: registers the link
     /// reference and attribute definitions at the start of the paragraph
     /// (whose content lines are `lines`) and drops their lines from it.
     /// Returns where the rest starts, or `None` when nothing is left.
+    /// A task item's box moves before the paragraph (so the definitions'
+    /// lines come between them), unless the paragraph ends with nothing left
+    /// (`keep_open` is false), when the caller turns the paragraph into the
+    /// box.
     fn cmark_resolve_definitions(
         &mut self,
         node_ix: TreeIndex,
-        lines: &[(usize, usize)],
+        lines: &[(usize, usize, usize)],
+        keep_open: bool,
     ) -> Option<usize> {
         let bytes = self.text.as_bytes();
         // A definition's label ends in `]:`.
@@ -880,9 +995,10 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         }
         let mut content = Vec::new();
         let mut offsets = Vec::with_capacity(lines.len());
-        for &(start, end) in lines {
+        for &(start, end, lead) in lines {
             // cmark ends every line with a single line feed.
             offsets.push(content.len());
+            content.resize(content.len() + lead, b' ');
             let line = &bytes[start..end];
             let length = line.len() - scan_rev_while(line, |b| b == b'\n' || b == b'\r');
             content.extend_from_slice(&line[..length]);
@@ -894,7 +1010,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         }
         let source = |offset: usize| {
             let line = offsets.partition_point(|&o| o <= offset) - 1;
-            (lines[line].0 + offset - offsets[line]).min(lines[line].1)
+            let (start, end, lead) = lines[line];
+            (start + (offset - offsets[line]).saturating_sub(lead)).min(end)
         };
         let text = |range: Range<usize>| String::from_utf8_lossy(&content[range]).into_owned();
         for definition in definitions {
@@ -946,6 +1063,16 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             Some(m) => self.tree[m].next,
             None => self.tree[node_ix].child,
         };
+        if let Some(m) = marker.filter(|_| first_kept_start.is_some() || keep_open) {
+            // The item is the paragraph's parent; the paragraph is its first
+            // child, right after the box was found.
+            if let Some(item) = self.tree.peek_grandparent() {
+                self.tree[item].child = Some(m);
+                self.tree[m].next = Some(node_ix);
+                self.tree[node_ix].child = child;
+                marker = None;
+            }
+        }
         match first_kept_start {
             Some(start) => {
                 while let Some(c) = child {
@@ -972,6 +1099,17 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 match marker {
                     Some(m) => self.tree[m].next = child,
                     None => self.tree[node_ix].child = child,
+                }
+                if child.is_none() {
+                    // Nothing of the rest is in the tree yet.
+                    self.tree.truncate_after(marker);
+                } else if self
+                    .tree
+                    .cur()
+                    .is_some_and(|cur| self.tree[cur].item.start < start)
+                {
+                    // Only the indentation node is.
+                    self.tree.truncate_after(child);
                 }
                 self.tree[node_ix].item.start = start;
             }
@@ -1474,7 +1612,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     begin_text = ix + count;
                     LoopInstruction::ContinueAndSkip(count - 1)
                 }
-                b'<' if bytes.get(ix + 1) != Some(&b'\\') => {
+                b'<' if bytes.get(ix + 1) != Some(&b'\\')
+                    || (self.options.cmark_gfm_compat()
+                        && mode.unescapes_pipes()
+                        && bytes.get(ix + 2) == Some(&b'|')) =>
+                {
                     // Note: could detect some non-HTML cases and early escape here, but not
                     // clear that's a win.
                     self.tree.append_text(begin_text, ix, backslash_escaped);

@@ -303,6 +303,15 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         }
     }
 
+    /// With `Options::ENABLE_CMARK_GFM_COMPAT`: the length of the input as
+    /// cmark-gfm received it, when the text given to the parser was changed
+    /// on the way (cmark's reference expansion limit is the input's length,
+    /// at least 100,000 bytes).
+    pub fn cmark_input_length(mut self, length: usize) -> Self {
+        self.link_ref_expansion_limit = length.max(100_000);
+        self
+    }
+
     /// Returns a reference to the internal `RefDefs` object, which provides access
     /// to the internal map of reference definitions.
     pub fn reference_definitions(&self) -> &RefDefs<'_> {
@@ -419,7 +428,9 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 ItemBody::MaybeHtml => {
                     let next = self.tree[cur_ix].next;
                     let autolink = if let Some(next_ix) = next {
-                        scan_autolink(block_text, self.tree[next_ix].item.start)
+                        let start = self.tree[next_ix].item.start;
+                        scan_autolink(block_text, start)
+                            .or_else(|| self.cmark_unescaped_autolink(block_text, start))
                     } else {
                         None
                     };
@@ -430,7 +441,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                             backslash_escaped: false,
                         };
                         if self.options.cmark_gfm_compat()
-                            && uri.contains("\\|")
+                            && block_text[self.tree[cur_ix].item.start + 1..ix - 1].contains("\\|")
                             && self.cmark_pipes_unescaped()
                         {
                             // cmark-gfm unescaped `\|` in the cell first.
@@ -1417,6 +1428,18 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         let handler = |bytes: &[u8]| Some(skip_container_prefixes(&self.tree, bytes, self.options));
         let key = cmark_compat::label_key_with(bytes, label, &handler)?;
         let span = self.tree[opener.node].item.start..end;
+        if let Some(definition) = self.allocs.refdefs.get(key.as_ref()) {
+            // `cmark_map_lookup`'s expansion limit: a definition too large
+            // for what is left is not used.
+            let title = definition.title.clone().unwrap_or_else(|| "".into());
+            let url = definition.dest.clone();
+            let size = url.len() + title.len();
+            if size > self.link_ref_expansion_limit {
+                return None;
+            }
+            self.link_ref_expansion_limit -= size;
+            return Some((end, link_type, url, title, key));
+        }
         let (link_type, url, title) =
             self.fetch_link_type_url_title(key.clone(), span, link_type)?;
         Some((end, link_type, url, title, key))
@@ -1446,6 +1469,27 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             )),
         };
         Some((end, url, title))
+    }
+
+    /// An autolink that only exists once `\|` is unescaped, as cmark-gfm
+    /// reads a table cell: an email address with `|` in it.
+    fn cmark_unescaped_autolink(
+        &self,
+        block_text: &'input str,
+        start: usize,
+    ) -> Option<(usize, CowStr<'input>, LinkType)> {
+        if !self.options.cmark_gfm_compat() {
+            return None;
+        }
+        let bytes = block_text.as_bytes();
+        let end = start + memchr::memchr(b'>', &bytes[start..])?;
+        let raw = &block_text[start..=end];
+        if !raw.contains("\\|") || !self.cmark_pipes_unescaped() {
+            return None;
+        }
+        let unescaped = raw.replace("\\|", "|");
+        let (length, uri, link_type) = scan_autolink(&unescaped, 0)?;
+        (length == unescaped.len()).then(|| (end + 1, CowStr::from(uri.into_string()), link_type))
     }
 
     /// Whether cmark-gfm read the current text with `\|` unescaped: a table

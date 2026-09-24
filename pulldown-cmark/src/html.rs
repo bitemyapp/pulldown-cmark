@@ -53,6 +53,8 @@ struct HtmlWriter<'a, I, W> {
     numbers: HashMap<CowStr<'a>, usize>,
     /// For each open link, whether it is an attribute span.
     link_spans: Vec<bool>,
+    /// Whether the last event was a task list marker.
+    after_task_marker: bool,
 }
 
 impl<'a, I, W> HtmlWriter<'a, I, W>
@@ -71,6 +73,7 @@ where
             table_cell_index: 0,
             numbers: HashMap::new(),
             link_spans: Vec::new(),
+            after_task_marker: false,
         }
     }
 
@@ -94,6 +97,13 @@ where
 
     fn run(mut self) -> Result<(), W::Error> {
         while let Some(event) = self.iter.next() {
+            // With `ENABLE_CMARK_GFM_COMPAT`, an item a lazy line made a task
+            // has a second marker, holding the same state, right after the
+            // first. It is one box.
+            let marker = matches!(event, TaskListMarker(_));
+            if std::mem::replace(&mut self.after_task_marker, marker) && marker {
+                continue;
+            }
             match event {
                 Start(tag) => {
                     self.start_tag(tag)?;
