@@ -147,7 +147,7 @@ impl ItemBody {
                 | MaybeAttributes
         )
     }
-    fn is_inline(&self) -> bool {
+    pub(crate) fn is_inline(&self) -> bool {
         use ItemBody::*;
         matches!(
             *self,
@@ -199,6 +199,8 @@ pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
     /// cmark-gfm's `no_link_openers`: set when a link is made, cleared when
     /// a `[` is pushed, so a link can hold a link opened after an inner one.
     cmark_no_link_openers: bool,
+    /// Scratch space for cmark-gfm's delimiter stack.
+    cmark_delimiters: Vec<cmark_compat::Delimiter>,
 
     // https://github.com/pulldown-cmark/pulldown-cmark/issues/844
     // Consider this example:
@@ -293,6 +295,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             wikilink_stack,
             html_scan_guard,
             cmark_no_link_openers: true,
+            cmark_delimiters: Vec::new(),
             // always allow 100KiB
             link_ref_expansion_limit: text.len().max(100_000),
             code_delims: CodeDelims::new(),
@@ -386,9 +389,12 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
     fn handle_inline(&mut self) {
         self.handle_inline_pass1();
         if self.options.cmark_gfm_compat() {
-            // cmark's delimiter algorithm resolves every `MaybeEmphasis`;
-            // the pass below then handles only hard breaks and quotes.
-            cmark_compat::process_emphasis(&mut self.tree, self.text);
+            // cmark's delimiter algorithm resolves every `MaybeEmphasis` and
+            // the hard breaks; only smart quotes are left.
+            cmark_compat::process_emphasis(&mut self.tree, self.text, &mut self.cmark_delimiters);
+            if !self.options.contains(Options::ENABLE_SMART_PUNCTUATION) {
+                return;
+            }
         }
         self.handle_emphasis_and_hard_break();
     }
@@ -418,14 +424,24 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                         None
                     };
 
-                    if let Some((ix, uri, link_type)) = autolink {
+                    if let Some((ix, mut uri, link_type)) = autolink {
                         let node = scan_nodes_to_ix(&self.tree, next, ix);
+                        let mut text_body = ItemBody::Text {
+                            backslash_escaped: false,
+                        };
+                        if self.options.cmark_gfm_compat()
+                            && uri.contains("\\|")
+                            && self.cmark_pipes_unescaped()
+                        {
+                            // cmark-gfm unescaped `\|` in the cell first.
+                            uri = cmark_compat::unescape_pipes(uri);
+                            text_body =
+                                ItemBody::SynthesizeText(self.allocs.allocate_cow(uri.clone()));
+                        }
                         let text_node = self.tree.create_node(Item {
                             start: self.tree[cur_ix].item.start + 1,
                             end: ix - 1,
-                            body: ItemBody::Text {
-                                backslash_escaped: false,
-                            },
+                            body: text_body,
                         });
                         let link_ix =
                             self.allocs
@@ -458,7 +474,18 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                 self.scan_inline_html(block_text.as_bytes(), ix)
                             }
                         });
-                        if let Some((span, ix)) = inline_html {
+                        if let Some((mut span, ix)) = inline_html {
+                            let html = &block_text[self.tree[cur_ix].item.start..ix];
+                            if self.options.cmark_gfm_compat()
+                                && span.is_empty()
+                                && html.contains("\\|")
+                                && self.cmark_pipes_unescaped()
+                            {
+                                // cmark-gfm unescaped `\|` in the cell first.
+                                span = cmark_compat::unescape_pipes(html.into())
+                                    .into_string()
+                                    .into_bytes();
+                            }
                             let node = scan_nodes_to_ix(&self.tree, next, ix);
                             self.tree[cur_ix].item.body = if !span.is_empty() {
                                 let converted_string =
@@ -1211,7 +1238,15 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                     cur = self.tree[cur_ix].next;
                 }
                 ItemBody::HardBreak(true) => {
-                    if self.tree[cur_ix].next.is_none() {
+                    // A backslash that ends the block is text. (cmark-gfm:
+                    // only the block's own end; a link's text can end in a
+                    // hard break.)
+                    let at_block_end = !self.options.cmark_gfm_compat()
+                        || !self
+                            .tree
+                            .peek_up()
+                            .is_some_and(|parent| self.tree[parent].item.body.is_inline());
+                    if self.tree[cur_ix].next.is_none() && at_block_end {
                         self.tree[cur_ix].item.body = ItemBody::SynthesizeChar('\\');
                     }
                     prev = cur;
@@ -1302,7 +1337,8 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
         if bytes.get(end) == Some(&b'(') {
             if let Some(length) = cmark_compat::scan_attributes(bytes, end + 1) {
                 let range = end + 1..end + 1 + length;
-                attributes = Some(CowStr::from(self.cmark_subject_text(block_text, range)));
+                let text = self.cmark_subject_text(block_text, range);
+                attributes = Some(self.cmark_unescape_pipes(text));
                 end += length + 2;
             }
         }
@@ -1401,21 +1437,45 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             _ => i + 1,
         };
         let (end, url, title) = cmark_compat::inline_link(bytes, ix, &step)?;
-        let url = cmark_compat::clean_url(&underlying[url]);
+        let url = self.cmark_unescape_pipes(self.cmark_subject_text(underlying, url));
+        let url = cmark_compat::clean_url(url);
         let title = match title {
-            None => String::new(),
-            Some(title) => cmark_compat::clean(
-                &self.cmark_subject_text(underlying, title.start + 1..title.end - 1),
-            ),
+            None => "".into(),
+            Some(title) => cmark_compat::clean(self.cmark_unescape_pipes(
+                self.cmark_subject_text(underlying, title.start + 1..title.end - 1),
+            )),
         };
-        Some((end, url.into(), title.into()))
+        Some((end, url, title))
+    }
+
+    /// Whether cmark-gfm read the current text with `\|` unescaped: a table
+    /// cell, or the paragraph it left before a table.
+    fn cmark_pipes_unescaped(&self) -> bool {
+        self.tree.is_in_table()
+            || (!self.allocs.cmark_unescaped_pipes.is_empty()
+                && self
+                    .tree
+                    .walk_spine()
+                    .any(|ix| self.allocs.cmark_unescaped_pipes.contains(ix)))
+    }
+
+    /// `text` as cmark-gfm read it (see `cmark_pipes_unescaped`).
+    fn cmark_unescape_pipes(&self, text: CowStr<'input>) -> CowStr<'input> {
+        if text.contains("\\|") && self.cmark_pipes_unescaped() {
+            cmark_compat::unescape_pipes(text)
+        } else {
+            text
+        }
     }
 
     /// The text of `range` as in cmark's subject: each line after the first
     /// without its container prefix, and without its indentation unless it
     /// is a lazy continuation line.
-    fn cmark_subject_text(&self, underlying: &'input str, range: Range<usize>) -> String {
+    fn cmark_subject_text(&self, underlying: &'input str, range: Range<usize>) -> CowStr<'input> {
         let bytes = underlying.as_bytes();
+        if memchr::memchr2(b'\n', b'\r', &bytes[range.clone()]).is_none() {
+            return underlying[range].into();
+        }
         let mut text = String::new();
         let mut mark = range.start;
         let mut i = mark;
@@ -1436,7 +1496,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             i += 1;
         }
         text.push_str(&underlying[mark..range.end]);
-        text
+        text.into()
     }
 
     // returns (bytes scanned, title cow)
@@ -1714,7 +1774,7 @@ pub(crate) fn scan_containers(
     line_start: &mut LineStart<'_>,
     options: Options,
 ) -> usize {
-    scan_containers_upto(tree, line_start, options, usize::MAX)
+    scan_spine_containers(tree, tree.walk_spine(), line_start, options)
 }
 
 /// `scan_containers` for the outermost `limit` containers.
@@ -1724,8 +1784,18 @@ pub(crate) fn scan_containers_upto(
     options: Options,
     limit: usize,
 ) -> usize {
+    scan_spine_containers(tree, tree.walk_spine().take(limit), line_start, options)
+}
+
+#[inline(always)]
+fn scan_spine_containers<'a>(
+    tree: &Tree<Item>,
+    spine: impl Iterator<Item = &'a TreeIndex>,
+    line_start: &mut LineStart<'_>,
+    options: Options,
+) -> usize {
     let mut i = 0;
-    for &node_ix in tree.walk_spine().take(limit) {
+    for &node_ix in spine {
         match tree[node_ix].item.body {
             ItemBody::BlockQuote(..) => {
                 let save = line_start.clone();

@@ -34,21 +34,20 @@ pub(crate) fn is_punctuation(c: char) -> bool {
     if cp < 128 {
         return (c as u8).is_ascii_punctuation();
     }
-    if cp < 0xA1 || cp > 0x1BC9F {
+    if !(0xA1..=0x1BC9F).contains(&cp) {
         return false;
     }
-    match PUNCTUATION.binary_search_by(|&(low, high)| {
-        if high < cp {
-            std::cmp::Ordering::Less
-        } else if low > cp {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    }) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    PUNCTUATION
+        .binary_search_by(|&(low, high)| {
+            if high < cp {
+                std::cmp::Ordering::Less
+            } else if low > cp {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// The non-ASCII ranges of `cmark_utf8proc_is_punctuation`, merged.
@@ -175,6 +174,12 @@ fn line_content_len(line: &[u8]) -> usize {
 /// row needs no pipe (`:-` is a one-column delimiter row) and a cell of
 /// only `:` is not a marker.
 pub(crate) fn table_delimiter_row(line: &[u8]) -> Option<Vec<Alignment>> {
+    if !matches!(
+        line.first(),
+        Some(b'|' | b':' | b'-' | b' ' | b'\t' | 0x0B | 0x0C)
+    ) {
+        return None;
+    }
     let len = line_content_len(line);
     let line = &line[..len];
     let mut p = 0;
@@ -409,7 +414,11 @@ fn spnl(input: &[u8], p: usize) -> usize {
 /// destination must end before the end of the input, may not start with a
 /// space, and stops at the first space even inside parentheses, which need
 /// not balance there; more than 32 open parentheses fail.
-pub(crate) fn scan_link_url(input: &[u8], offset: usize) -> Option<(usize, Range<usize>)> {
+pub(crate) fn scan_link_url(
+    input: &[u8],
+    offset: usize,
+    step: &dyn Fn(usize) -> usize,
+) -> Option<(usize, Range<usize>)> {
     let mut i = offset;
     if input.get(i) == Some(&b'<') {
         i += 1;
@@ -419,7 +428,17 @@ pub(crate) fn scan_link_url(input: &[u8], offset: usize) -> Option<(usize, Range
                     i += 1;
                     break;
                 }
-                b'\\' => i += 2,
+                b'\\' => {
+                    // The backslash and the next character, which may be a
+                    // line ending (cmark's subject has only `\n`).
+                    i += 1;
+                    if input.get(i) == Some(&b'\r') && input.get(i + 1) == Some(&b'\n') {
+                        i += 1;
+                    }
+                    if i < input.len() {
+                        i = step(i);
+                    }
+                }
                 b'\n' | b'<' => return None,
                 _ => i += 1,
             }
@@ -546,7 +565,10 @@ pub(crate) fn scan_entity(bytes: &[u8]) -> (usize, Option<CowStr<'static>>) {
 }
 
 /// `houdini_unescape_html_f`: entities decoded.
-fn decode_entities(text: &str) -> String {
+fn decode_entities(text: CowStr<'_>) -> CowStr<'_> {
+    if !text.contains('&') {
+        return text;
+    }
     let bytes = text.as_bytes();
     let mut decoded = String::with_capacity(text.len());
     let mut mark = 0;
@@ -564,11 +586,14 @@ fn decode_entities(text: &str) -> String {
         i += 1;
     }
     decoded.push_str(&text[mark..]);
-    decoded
+    decoded.into()
 }
 
 /// `cmark_strbuf_unescape`: a backslash before ASCII punctuation dropped.
-fn unescape_backslashes(text: &str) -> String {
+fn unescape_backslashes(text: CowStr<'_>) -> CowStr<'_> {
+    if !text.contains('\\') {
+        return text;
+    }
     let mut result = String::with_capacity(text.len());
     let mut characters = text.chars().peekable();
     while let Some(c) = characters.next() {
@@ -580,7 +605,7 @@ fn unescape_backslashes(text: &str) -> String {
             _ => result.push(c),
         }
     }
-    result
+    result.into()
 }
 
 /// `cmark_strbuf_trim`'s characters.
@@ -590,19 +615,37 @@ fn trim_cmark_space(text: &str) -> &str {
 
 /// `cmark_clean_url` and `cmark_clean_title`'s unescaping: entities first,
 /// then backslash escapes in the result, so `\\&amp;` becomes `&`.
-pub(crate) fn clean(text: &str) -> String {
-    unescape_backslashes(&decode_entities(text))
+pub(crate) fn clean(text: CowStr<'_>) -> CowStr<'_> {
+    unescape_backslashes(decode_entities(text))
 }
 
 /// A fenced code block's info string as cmark's `finalize` makes it:
 /// entities decoded, then trimmed, then backslash escapes removed.
-pub(crate) fn clean_info(text: &str) -> String {
-    unescape_backslashes(trim_cmark_space(&decode_entities(text)))
+pub(crate) fn clean_info(text: &str) -> CowStr<'_> {
+    let decoded = decode_entities(text.into());
+    let trimmed: CowStr<'_> = match decoded {
+        CowStr::Borrowed(text) => trim_cmark_space(text).into(),
+        other => trim_cmark_space(&other).to_owned().into(),
+    };
+    unescape_backslashes(trimmed)
+}
+
+/// The table extension's `unescape_pipes`: a backslash before `|` goes.
+pub(crate) fn unescape_pipes(text: CowStr<'_>) -> CowStr<'_> {
+    if text.contains("\\|") {
+        text.replace("\\|", "|").into()
+    } else {
+        text
+    }
 }
 
 /// `cmark_clean_url`: trimmed, then unescaped.
-pub(crate) fn clean_url(text: &str) -> String {
-    clean(trim_cmark_space(text))
+pub(crate) fn clean_url(text: CowStr<'_>) -> CowStr<'_> {
+    let trimmed: CowStr<'_> = match text {
+        CowStr::Borrowed(text) => trim_cmark_space(text).into(),
+        other => trim_cmark_space(&other).to_owned().into(),
+    };
+    clean(trimmed)
 }
 
 /// An inline link's `(destination "title")` at `ix` (the `(`), as
@@ -625,7 +668,7 @@ pub(crate) fn inline_link(
         p
     };
     let url_start = spaces(ix + 1);
-    let (length, url) = scan_link_url(bytes, url_start)?;
+    let (length, url) = scan_link_url(bytes, url_start, step)?;
     let url_end = url_start + length;
     let title_start = spaces(url_end);
     let title_end = if title_start == url_end {
@@ -661,7 +704,7 @@ fn reference_definition(input: &[u8], p: usize) -> Option<(usize, Definition)> {
         return None;
     }
     p = spnl(input, p + 1);
-    let (length, url) = scan_link_url(input, p)?;
+    let (length, url) = scan_link_url(input, p, &|i| i + 1)?;
     p += length;
     let before_title = p;
     p = spnl(input, p);
@@ -749,11 +792,23 @@ pub(crate) fn line_around(bytes: &[u8], ix: usize) -> &[u8] {
     &bytes[start..end]
 }
 
+/// The column of `offset` in `line`, tabs stopping every 4 columns.
+fn column_of(line: &[u8], offset: usize) -> usize {
+    line[..offset].iter().fold(0, |column, &b| {
+        if b == b'\t' {
+            column + 4 - column % 4
+        } else {
+            column + 1
+        }
+    })
+}
+
 /// The tasklist extension's pattern, matched from the start of the line:
 /// `spacechar* ("-"|"+"|"*"|[0-9]+.) spacechar+ ("[ ]"|"[x]") spacechar+`,
 /// with `x` in either case. So a task needs text or a space after its box,
 /// and an item after a block quote marker or another item's marker on the
-/// same line is not a task.
+/// same line is not a task. Nor is a box 5 or more columns after the marker:
+/// that is an indented code block, which `open_new_blocks` tries first.
 pub(crate) fn is_task_line(line: &[u8]) -> bool {
     let mut position = 0;
     while position < line.len() && is_table_space(line[position]) {
@@ -768,6 +823,7 @@ pub(crate) fn is_task_line(line: &[u8]) -> bool {
             position += 1;
         }
         position > spaces
+            && column_of(line, position) - column_of(line, spaces) < 5
             && line.len() > position + 3
             && line[position] == b'['
             && matches!(line[position + 1], b' ' | b'x' | b'X')
@@ -802,7 +858,8 @@ pub(crate) fn is_task_line(line: &[u8]) -> bool {
 
 /// `open_tasklist_item`'s check: `[x]` or `[X]` anywhere on the line.
 pub(crate) fn task_line_checked(line: &[u8]) -> bool {
-    memchr::memmem::find(line, b"[x]").is_some() || memchr::memmem::find(line, b"[X]").is_some()
+    line.windows(3)
+        .any(|window| window == b"[x]" || window == b"[X]")
 }
 
 // MARK: HTML
@@ -1174,7 +1231,7 @@ pub(crate) const HTML_BLOCK_END_TAGS: [&str; 5] =
 /// non-space character) ends the block: `scan_html_block_end_1` to `_5`.
 pub(crate) fn html_block_ends(kind: u8, line: &[u8]) -> bool {
     let line = &line[..memchr::memchr(b'\n', line).unwrap_or(line.len())];
-    let contains = |needle: &[u8]| memchr::memmem::find(line, needle).is_some();
+    let contains = |needle: &[u8]| line.windows(needle.len()).any(|window| window == needle);
     match kind {
         1 => line.windows(2).enumerate().any(|(i, w)| {
             w == b"</"
@@ -1293,7 +1350,8 @@ impl Backticks {
 /// A delimiter run on cmark's delimiter stack (`delimiter` in inlines.c).
 /// Its characters are the tree nodes `start .. start + count`; an opener
 /// gives up characters from its end, a closer from its start.
-struct Delimiter {
+#[derive(Debug, Clone)]
+pub(crate) struct Delimiter {
     start: TreeIndex,
     count: usize,
     /// The run's original length, for the "multiple of 3" rule.
@@ -1311,12 +1369,21 @@ struct Delimiter {
 /// (`strikethrough.c`'s `insert`), over the siblings from `tree.cur()`.
 /// Resolves every `MaybeEmphasis` node into emphasis, strong emphasis,
 /// strikethrough or text. A list of positions in the stack stands in for
-/// cmark's subject offsets.
-pub(crate) fn process_emphasis(tree: &mut Tree<Item>, text: &str) {
-    let mut delimiters: Vec<Delimiter> = Vec::new();
+/// cmark's subject offsets. Also makes a backslash hard break that ends a
+/// block text. `delimiters` is scratch space.
+pub(crate) fn process_emphasis(tree: &mut Tree<Item>, text: &str, delimiters: &mut Vec<Delimiter>) {
+    delimiters.clear();
+    let at_block_level = !tree
+        .peek_up()
+        .is_some_and(|parent| tree[parent].item.body.is_inline());
     let mut before = None;
     let mut cursor = tree.cur();
     while let Some(ix) = cursor {
+        if let ItemBody::HardBreak(true) = tree[ix].item.body {
+            if tree[ix].next.is_none() && at_block_level {
+                tree[ix].item.body = ItemBody::SynthesizeChar('\\');
+            }
+        }
         if let ItemBody::MaybeEmphasis(count, can_open, can_close) = tree[ix].item.body {
             let previous = delimiters.len().checked_sub(1);
             if let Some(previous) = previous {
@@ -1382,9 +1449,9 @@ pub(crate) fn process_emphasis(tree: &mut Tree<Item>, text: &str) {
         closer = match opener {
             Some(opener_ix) if opener_found => {
                 if d.c == b'~' {
-                    insert_strikethrough(tree, &mut delimiters, opener_ix, closer_ix)
+                    insert_strikethrough(tree, delimiters, opener_ix, closer_ix)
                 } else {
-                    insert_emphasis(tree, &mut delimiters, opener_ix, closer_ix)
+                    insert_emphasis(tree, delimiters, opener_ix, closer_ix)
                 }
             }
             _ => delimiters[closer_ix].next,
@@ -1393,13 +1460,13 @@ pub(crate) fn process_emphasis(tree: &mut Tree<Item>, text: &str) {
             let d = &delimiters[old_closer];
             openers_bottom[slot(d.c)][d.length % 3] = old_closer;
             if !d.can_open {
-                remove_delimiter(&mut delimiters, old_closer);
+                remove_delimiter(delimiters, old_closer);
             }
         }
     }
 
     // Whatever is left over is text.
-    for d in &delimiters {
+    for d in delimiters.iter() {
         for i in 0..d.count {
             tree[d.start + i].item.body = ItemBody::Text {
                 backslash_escaped: false,

@@ -96,6 +96,8 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         self.brace_context_next = 0;
 
         let i = scan_containers(&self.tree, &mut line_start, self.options);
+        let item_emptied =
+            std::mem::take(&mut self.cmark_item_emptied) && i == self.tree.spine_len();
         for _ in i..self.tree.spine_len() {
             self.pop(start_ix);
         }
@@ -141,10 +143,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                 if self.options.cmark_gfm_compat() {
                     // Part of a tab may have gone to a container's prefix:
                     // the indentation can be less than a byte a column.
-                    while item_start < container_start && !matches!(bytes[item_start], b' ' | b'\t')
-                    {
-                        item_start += 1;
-                    }
+                    let whitespace = bytes[..container_start]
+                        .iter()
+                        .rev()
+                        .take_while(|&&b| b == b' ' || b == b'\t')
+                        .count();
+                    item_start = item_start.max(container_start - whitespace);
                 }
                 self.continue_list(item_start, ch, index);
                 self.tree.append(Item {
@@ -307,7 +311,6 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
         let ix = start_ix + line_start.bytes_scanned();
 
-        let item_emptied = std::mem::take(&mut self.cmark_item_emptied);
         if let Some(n) = scan_blank_line(&bytes[ix..]) {
             if item_emptied
                 && self
@@ -354,6 +357,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
         // Save `remaining_space` here to avoid needing to backtrack `line_start` for HTML blocks
         let remaining_space = line_start.remaining_space();
+        let before_indent = start_ix + line_start.bytes_scanned();
 
         let indent = line_start.scan_space_upto(4);
         if indent == 4 {
@@ -432,7 +436,14 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
         if let Some((n, fence_ch)) = scan_code_fence(&bytes[ix..]) {
             self.finish_list(start_ix);
-            return self.parse_fenced_code_block(ix, indent, fence_ch, n);
+            // cmark-gfm counts the fence's offset in bytes (a partly consumed
+            // tab is one), and strips that many columns from later lines.
+            let fence_indent = if self.options.cmark_gfm_compat() {
+                ix - before_indent + usize::from(remaining_space > 0)
+            } else {
+                indent
+            };
+            return self.parse_fenced_code_block(ix, fence_indent, fence_ch, n);
         }
 
         // parse refdef (cmark-gfm finds them when the paragraph ends instead;
@@ -840,14 +851,14 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     self.tree[node_ix].item = self.tree[marker].item;
                     self.tree[node_ix].child = None;
                 }
-                None => {
-                    self.tree.remove_trailing_nodes(node_ix, before_paragraph);
-                    self.cmark_item_emptied = before_paragraph.is_none()
-                        && self.tree.peek_up().is_some_and(|item| {
-                            matches!(self.tree[item].item.body, ItemBody::ListItem(_))
-                        });
-                }
+                None => self.tree.remove_trailing_nodes(node_ix, before_paragraph),
             }
+            // An item left with no blocks.
+            self.cmark_item_emptied = before_paragraph.is_none()
+                && self
+                    .tree
+                    .peek_up()
+                    .is_some_and(|item| matches!(self.tree[item].item.body, ItemBody::ListItem(_)));
         }
         ix
     }
@@ -862,14 +873,20 @@ impl<'a, 'b> FirstPass<'a, 'b> {
         lines: &[(usize, usize)],
     ) -> Option<usize> {
         let bytes = self.text.as_bytes();
+        // A definition's label ends in `]:`.
+        let (first, last) = (lines[0].0, lines[lines.len() - 1].1);
+        if !bytes[first..last].windows(2).any(|pair| pair == b"]:") {
+            return Some(first);
+        }
         let mut content = Vec::new();
         let mut offsets = Vec::with_capacity(lines.len());
         for &(start, end) in lines {
+            // cmark ends every line with a single line feed.
             offsets.push(content.len());
-            content.extend_from_slice(&bytes[start..end]);
-            if !matches!(content.last(), Some(b'\n' | b'\r')) {
-                content.push(b'\n');
-            }
+            let line = &bytes[start..end];
+            let length = line.len() - scan_rev_while(line, |b| b == b'\n' || b == b'\r');
+            content.extend_from_slice(&line[..length]);
+            content.push(b'\n');
         }
         let (consumed, definitions) = cmark_compat::parse_definitions(&content);
         if definitions.is_empty() {
@@ -889,9 +906,11 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                     if self.allocs.cmark_attributes.contains_key(&key) {
                         continue;
                     }
-                    let dest = CowStr::from(cmark_compat::clean_url(&text(url)));
+                    let dest =
+                        CowStr::from(cmark_compat::clean_url(text(url).into()).into_string());
                     let title = title.map(|title| {
-                        CowStr::from(cmark_compat::clean(&text(title.start + 1..title.end - 1)))
+                        let title = text(title.start + 1..title.end - 1);
+                        CowStr::from(cmark_compat::clean(title.into()).into_string())
                     });
                     let span = source(label.start - 1)..source(label.end);
                     self.allocs
@@ -1037,7 +1056,10 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             }
             Some((last, paragraph_end, trailing_backslash)) => {
                 let paragraph_start = self.tree[node_ix].item.start;
-                if memchr::memmem::find(&bytes[paragraph_start..header_ix], b"\\|").is_some() {
+                if bytes[paragraph_start..header_ix]
+                    .windows(2)
+                    .any(|pair| pair == b"\\|")
+                {
                     self.cmark_reparse_unescaped(node_ix, paragraph_start, paragraph_end);
                 } else {
                     self.tree.truncate_after(last);
@@ -1674,6 +1696,17 @@ impl<'a, 'b> FirstPass<'a, 'b> {
 
             let next_line_ix = ix + line_start.bytes_scanned();
             if next_line_ix == self.text.len() {
+                if self.options.cmark_gfm_compat() && ix < self.text.len() {
+                    // cmark ends the last line with a line feed: a last line
+                    // with nothing after its containers' prefixes is a blank
+                    // line of the block.
+                    let newline = self.allocs.allocate_cow("\n".into());
+                    self.tree.append(Item {
+                        start: next_line_ix,
+                        end: next_line_ix,
+                        body: ItemBody::SynthesizeText(newline),
+                    });
+                }
                 end_ix = next_line_ix;
                 break;
             }
@@ -1799,7 +1832,7 @@ impl<'a, 'b> FirstPass<'a, 'b> {
             let rest = &bytes[start_ix + n_fence_char..];
             let line_end =
                 start_ix + n_fence_char + memchr::memchr2(b'\n', b'\r', rest).unwrap_or(rest.len());
-            cmark_compat::clean_info(&self.text[start_ix + n_fence_char..line_end]).into()
+            cmark_compat::clean_info(&self.text[start_ix + n_fence_char..line_end])
         } else {
             unescape(&self.text[info_start..info_end], self.tree.is_in_table())
         };
